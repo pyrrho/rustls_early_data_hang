@@ -59,7 +59,11 @@ fn main() -> eyre::Result<()> {
     })
 }
 
-fn serve_once(mut conn: TcpStream, mut tls: rustls::Connection) -> eyre::Result<()> {
+fn serve_once(mut conn: TcpStream, tls: rustls::Connection) -> eyre::Result<()> {
+    let rustls::Connection::Server(mut tls) = tls else {
+        panic!("How did we get a client connection in here?");
+    };
+
     while tls.is_handshaking() {
         match tls.complete_io(&mut conn) {
             Ok(_) => {}
@@ -68,33 +72,57 @@ fn serve_once(mut conn: TcpStream, mut tls: rustls::Connection) -> eyre::Result<
                 return Ok(());
             }
         };
+        let kind = tls.handshake_kind();
+        tracing::info!(?kind, "tls handshake finished");
     }
 
     let mut request = vec![0u8; 4096];
     let mut cursor = 0;
-    loop {
-        tracing::info!("Is the connection stuck?");
-        tls.complete_io(&mut conn)?;
-        tracing::info!("Nope!");
-        let mut reader = tls.reader();
-        let bytes_read = match reader.read(&mut request[cursor..]) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == ErrorKind::WouldBlock => 0,
-            otherwise => {
-                otherwise.unwrap();
-                0
-            }
-        };
-        cursor += bytes_read;
 
-        // lol trust the client
-        if unsafe {
-            std::str::from_utf8_unchecked(&request[..cursor])
-                .lines()
-                .last()
-                == Some("")
-        } {
-            break;
+    let has_early_data = tls.early_data().is_some();
+
+    if let Some(mut early_data) = tls.early_data() {
+        loop {
+            let bytes_read = match early_data.read(&mut request[cursor..]) {
+                Ok(0) => break,
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::error!(?err, "failed to read early data");
+                    panic!("boom");
+                },
+            };
+            cursor += bytes_read;
+        }
+        let tls_wants_read = tls.wants_read();
+        tracing::info!(bytes_read = cursor, tls_wants_read, "received early data");
+    }
+
+    // Set this to false, and requests sent as early data will succeed.
+    let read_from_tls_anyway = true;
+    if !has_early_data || read_from_tls_anyway {
+        tracing::info!("no early data reading from the tcp stream");
+        loop {
+            tls.complete_io(&mut conn)?;
+            let mut reader = tls.reader();
+            let bytes_read = match reader.read(&mut request[cursor..]) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => 0,
+                otherwise => {
+                    otherwise.unwrap();
+                    0
+                }
+            };
+            cursor += bytes_read;
+
+            // lol trust the client
+            if unsafe {
+                std::str::from_utf8_unchecked(&request[..cursor])
+                    .lines()
+                    .last()
+                    == Some("")
+            } {
+                break;
+            }
         }
     }
 
@@ -150,7 +178,11 @@ fn error() -> String {
 }
 
 #[tracing::instrument(skip_all)]
-fn respond(response: String, mut conn: TcpStream, mut tls: rustls::Connection) -> eyre::Result<()> {
+fn respond(
+    response: String,
+    mut conn: TcpStream,
+    mut tls: rustls::ServerConnection,
+) -> eyre::Result<()> {
     tracing::info!("starting response");
     let mut buf = response.as_bytes();
     loop {
